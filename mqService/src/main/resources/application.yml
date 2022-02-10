@@ -1,0 +1,31 @@
+#\u6CE8\u518C\u670D\u52A1\u7684\u540D\u79F0
+dubbo:
+  application:
+    name: mqService
+  #\u6CE8\u518C\u4E2D\u5FC3\u7684ip\u5730\u5740
+  registry:
+    address: 127.0.0.1:2181  #\u6CE8\u518C\u4E2D\u5FC3\u7684\u5730\u5740
+    protocol: zookeeper #\u6CE8\u518C\u4E2D\u5FC3\u7684\u540D\u79F0
+  protocol:
+    name: dubbo #dubbo\u4F7F\u7528\u7684\u901A\u4FE1\u534F\u8BAE\u540D\u79F0
+    port: 20890 #dubbo\u4F7F\u7528\u7684\u901A\u4FE1\u534F\u8BAE\u7AEF\u53E3
+    serialization: kryo
+  monitor:
+    protocol: registry #\u8FDE\u63A5\u76D1\u63A7\u4E2D\u5FC3\u7684\u914D\u7F6E
+#\u914D\u7F6Emapper.xml\u7684\u8DEF\u5F84
+mybatis:
+  mapper-locations: classpath:mapping/*.xml
+spring:
+  #\u914D\u7F6E\u6570\u636E\u5E93JDBC\u6570\u636E\u6E90
+  datasource:
+    url: jdbc:mysql://localhost:3306/miaosha?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=UTC
+    username: root
+    password: 77549252q
+    type: com.alibaba.druid.pool.DruidDataSource
+    driver-class-name: com.mysql.cj.jdbc.Driver
+server:
+  port: 8084
+mq:
+  topicName: stock
+  nameserver:
+    addr: 192.168.1.70:9876

@@ -1,0 +1,160 @@
+package com.Long.service;
+
+import com.Long.dao.stockLogMapper;
+import com.Long.Error.BusinessException;
+import com.Long.entity.stockLog;
+import com.alibaba.dubbo.config.annotation.Reference;
+import com.alibaba.dubbo.config.annotation.Service;
+import com.alibaba.fastjson.JSON;
+import org.apache.rocketmq.client.exception.MQBrokerException;
+import org.apache.rocketmq.client.exception.MQClientException;
+import org.apache.rocketmq.client.producer.*;
+import org.apache.rocketmq.common.message.Message;
+import org.apache.rocketmq.common.message.MessageExt;
+import org.apache.rocketmq.remoting.exception.RemotingException;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import javax.annotation.PostConstruct;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+
+   /**
+      * @autor Jack Chao
+      * @version
+      * @ClassName : MqProducer
+      * @date : 2022/2/8 10:26
+      *@description: 消息生产者 事务型消息，会随着下单操作的失败或成功进行回滚或提交
+    * RocketMQ消息的事务架构设计：
+    * 生产者执行本地事务，修改订单支付状态（下单），并且提交事务
+    * 生产者发送事务消息到broker上，消息发送到broker上在没有确认之前，消息对于consumer是不可见状态（prepare状态）
+    * 生产者确认事务消息，使得发送到broker上的事务消息对于消费者可见
+    * 消费者获取到消息进行消费，消费完之后执行ack进行确认
+    */
+
+@Component
+@Service(interfaceClass = com.Long.service.mqService.class)
+public class MqProducer implements mqService{
+
+    private DefaultMQProducer producer;
+
+    // 事务型producer
+    private TransactionMQProducer transactionMQProducer;
+
+    @Value("${mq.nameserver.addr}")
+    private String nameAddr;
+
+    @Value("${mq.topicName}")
+    private String topicName;
+
+
+    @Reference
+    private OrderService orderService;
+
+    @Autowired
+    private stockLogMapper stockLogMapper;
+
+
+    @PostConstruct
+    public  void init() throws MQClientException {
+        // 做mq producer的初始化
+        producer = new DefaultMQProducer("producer_group");
+        producer.setNamesrvAddr(nameAddr);
+        producer.start();
+        transactionMQProducer = new TransactionMQProducer("transaction_producer_group");
+        transactionMQProducer.setNamesrvAddr(nameAddr);
+        transactionMQProducer.start();
+        transactionMQProducer.setTransactionListener(new TransactionListener() {
+            @Override
+            public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+                //真正要做的事  创建订单
+                Integer itemId = (Integer) ((Map)arg).get("itemId");
+                Integer promoId = (Integer) ((Map)arg).get("promoId");
+                Integer userId = (Integer) ((Map)arg).get("userId");
+                Integer amount = (Integer) ((Map)arg).get("amount");
+                String stockLogId = (String) ((Map)arg).get("stockLogId");
+                try {
+                    orderService.createOrder(userId,itemId,promoId,amount,stockLogId);
+                } catch (BusinessException e) {
+                    e.printStackTrace();
+                    //设置对应的stockLog为回滚状态
+                    stockLog stockLogDO = stockLogMapper.selectByPrimaryKey(stockLogId);
+                    stockLogDO.setStatus(3);
+                    stockLogMapper.updateByPrimaryKeySelective(stockLogDO);
+                    return LocalTransactionState.ROLLBACK_MESSAGE;
+                }
+                return LocalTransactionState.COMMIT_MESSAGE;
+            }
+            /**
+             * @Description // 相当于上面创建订单执行阻塞时或mysql宕机时，会回调此方法进行回调或提交处理。
+             **/
+            @Override
+            public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+                // 根据是否扣减库存成功，来判断要返回COMMIT,ROLLBACK还是继续UNKNOWN
+                String jsonString  = new String(msg.getBody());
+                Map map = JSON.parseObject(jsonString, Map.class);
+                Integer itemId = (Integer) map.get("itemId");
+                Integer amount = (Integer) map.get("amount");
+                String stockLogId = (String) map.get("stockLogId");
+                stockLog stockLogDO = stockLogMapper.selectByPrimaryKey(stockLogId);
+                if(stockLogDO == null){
+                    return LocalTransactionState.UNKNOW;
+                }
+                if(stockLogDO.getStatus() == 2){
+                    return LocalTransactionState.COMMIT_MESSAGE;
+                }else if(stockLogDO.getStatus() == 1){
+                    return LocalTransactionState.UNKNOW;
+                }
+                return LocalTransactionState.ROLLBACK_MESSAGE;
+            }
+        });
+    }
+
+    //事务型同步库存扣减消息
+    @Override
+    public boolean transactionAsyncReduceStock(Integer userId, Integer itemId, Integer promoId, Integer amount, String stockLogId){
+        Map<String,Object> bodyMap = new HashMap<>();
+        bodyMap.put("itemId",itemId);
+        bodyMap.put("amount",amount);
+        bodyMap.put("stockLogId",stockLogId);
+
+        Map<String,Object> argsMap = new HashMap<>();
+        argsMap.put("itemId",itemId);
+        argsMap.put("amount",amount);
+        argsMap.put("userId",userId);
+        argsMap.put("promoId",promoId);
+        argsMap.put("stockLogId",stockLogId);
+
+        Message message = new Message(topicName,"increase",
+                JSON.toJSON(bodyMap).toString().getBytes(StandardCharsets.UTF_8));
+        TransactionSendResult sendResult = null;
+        try {
+            sendResult = transactionMQProducer.sendMessageInTransaction(message,argsMap);
+        } catch (MQClientException e) {
+            e.printStackTrace();
+            return false;
+        }
+        if(sendResult.getLocalTransactionState() == LocalTransactionState.ROLLBACK_MESSAGE){
+            return false;
+        }else return sendResult.getLocalTransactionState() == LocalTransactionState.COMMIT_MESSAGE;
+
+    }
+
+
+    // 同步库存扣减消息
+    @Override
+    public boolean asyncReduceStock(Integer itemId, Integer amount){
+        Map<String,Object> bodyMap = new HashMap<>();
+        bodyMap.put("itemId",itemId);
+        bodyMap.put("amount",amount);
+        Message message = new Message(topicName,"increase", JSON.toJSON(bodyMap).toString().getBytes(StandardCharsets.UTF_8));
+        try {
+            producer.send(message);
+        } catch (MQClientException | RemotingException | MQBrokerException | InterruptedException e) {
+            e.printStackTrace();
+            return false;
+        }
+        return true;
+    }
+}
